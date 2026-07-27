@@ -1,0 +1,82 @@
+# Build the Logstash-SP image and push it to ACR through the service connection.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - Dockerfile
+      - pom.xml
+      - azure-pipelines.yml
+
+# No PR builds.
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  dockerRegistryServiceConnection: '<acr-service-connection>'
+  acrName: '<acr-name>'
+  # Must match the Deployment manifest's image name.
+  imageRepository: 'logstash-sp'
+  # Keep in lockstep with the Dockerfile FROM line and the manifest tag.
+  baseTag: '9.4.3'
+  # Bump when the image changes, then set deployment.yaml's tag to <baseTag>-<imageRevision> (e.g. 9.4.3-1).
+  imageRevision: '1'
+  mavenImage: 'maven:3.9-eclipse-temurin-21'
+  # Runtime expression $[ ]: Build.SourceVersion is empty at compile time.
+  gitShaShort: $[ substring(variables['Build.SourceVersion'], 0, 8) ]
+
+stages:
+  - stage: BuildAndPush
+    displayName: 'Build custom Logstash-SP image and push to ACR'
+    jobs:
+      - job: build
+        displayName: 'Fetch jars → build image → push'
+        steps:
+
+          # Maven resolves the full transitive tree; hand-picking jars misses msal4j and SP login fails.
+          - script: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$(Build.SourcesDirectory):/work" \
+                -w /work \
+                "$(mavenImage)" \
+                mvn -B dependency:copy-dependencies \
+                  -DoutputDirectory=drivers \
+                  -DincludeScope=runtime
+            displayName: 'Maven: resolve mssql-jdbc + Entra jars into ./drivers'
+
+          # Fail fast if ./drivers is empty; that image would fail at SP login.
+          - script: |
+              set -euo pipefail
+              echo "Resolved jars:"
+              ls -1 "$(Build.SourcesDirectory)/drivers"
+              for anchor in mssql-jdbc azure-identity msal4j; do
+                ls "$(Build.SourcesDirectory)/drivers/" | grep -q "$anchor" \
+                  || { echo "##vso[task.logissue type=error]Missing $anchor jar — SP auth would fail"; exit 1; }
+              done
+            displayName: 'Verify the driver + Entra anchor jars are present'
+
+          # Tags: build id + git SHA + pinned version tag. Never :latest.
+          - task: Docker@2
+            displayName: 'Build and push logstash-sp image to ACR'
+            inputs:
+              command: 'buildAndPush'
+              containerRegistry: '$(dockerRegistryServiceConnection)'
+              repository: '$(imageRepository)'
+              Dockerfile: 'Dockerfile'
+              buildContext: '.'
+              tags: |
+                $(baseTag)-$(imageRevision)
+                $(Build.BuildId)
+                $(gitShaShort)
+
+          - script: |
+              echo "Pushed to ACR:"
+              echo "  $(acrName).azurecr.io/$(imageRepository):$(baseTag)-$(imageRevision)   <- deployment.yaml pins this one"
+              echo "  $(acrName).azurecr.io/$(imageRepository):$(Build.BuildId)"
+              echo "  $(acrName).azurecr.io/$(imageRepository):$(gitShaShort)"
+            displayName: 'Report pushed image tags'
